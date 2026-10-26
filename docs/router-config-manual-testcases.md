@@ -263,3 +263,15 @@ cd weworker/backend-ts && npx vitest --run src/api-query-router/__tests__/shippe
 **用户级覆盖放哪？**
 
 `~/.weworker/router/`，文件名与本目录一致；按 `id` / key 逐条合并，同 id 覆盖、新 id 追加。
+
+**第 4 层（探索转交）什么时候才会触发？**
+
+默认 `strict` 档，必须**同时**满足：siteGate `miss`、用户在**显式给链接**（整条消息就是一个 URL／裸域名，或 ≤64 字且句首是「打开/看看/分析…」）、该 host 本地**无任何承接能力**（已注册 adapter（含禁用）/ `*.` 通配子域 / 已毕业 toolkit skill / 用户目录已装包）、且会话权限为 `full`。
+
+自查时按这个顺序发两条（**手工观察，不进 `route:replay` 的表**）：
+
+- 该转的：`https://<未接入站点>` 单发一条 → 日志出现 `tier4: task=…`；
+- 不该转的：`参考 <未接入站点> 的写法改一下我的 adapter` → 日志出现 `tier4: skip reason=not-explicit-link`。
+
+只想临时退回旧的宽触发（历史上的「句子里出现未注册域名就转交」），设 `WEWORKER_TIER4_TRIGGER=legacy`；整层急停仍是 `WEWORKER_TIER4=0`。
+

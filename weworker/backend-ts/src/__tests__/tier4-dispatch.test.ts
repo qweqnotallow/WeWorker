@@ -12,7 +12,10 @@ import {
   buildTier4Instruction,
   decideTier4,
   extractUnknownSiteUrl,
+  isExplicitLinkInput,
+  isKnownSiteHost,
   isTier4Enabled,
+  normalizeHost,
   runWebwrightTaskTurn,
   tier4TimeoutMs,
 } from '../tier4-dispatch.js'
@@ -49,12 +52,14 @@ const ADAPTERS = new Map([
 
 beforeEach(() => {
   delete process.env.WEWORKER_TIER4
+  delete process.env.WEWORKER_TIER4_TRIGGER
   delete process.env.WEWORKER_TIER4_TIMEOUT_MS
   delete process.env.WEWORKER_TIER4_ALLOW_WRITES
 })
 
 afterEach(() => {
   delete process.env.WEWORKER_TIER4
+  delete process.env.WEWORKER_TIER4_TRIGGER
   delete process.env.WEWORKER_TIER4_TIMEOUT_MS
   delete process.env.WEWORKER_TIER4_ALLOW_WRITES
 })
@@ -130,24 +135,106 @@ describe('decideTier4：分流判定矩阵', () => {
     expect(decideTier4('看看 shop.example.org', disabled, ADAPTERS).reason).toBe('sitegate-disabled')
   })
 
-  it('miss 但没有未知站点信号 → 不转发', () => {
+  it('miss 但没有未知站点信号 → 不转发（strict 档先卡形态闸门）', () => {
     expect(decideTier4('帮我写个周报', MISS, ADAPTERS)).toEqual({
+      dispatch: false,
+      startUrl: null,
+      reason: 'not-explicit-link',
+    })
+    expect(decideTier4('帮我写个周报', MISS, ADAPTERS, { triggerMode: 'legacy' })).toEqual({
       dispatch: false,
       startUrl: null,
       reason: 'no-unknown-site-signal',
     })
   })
 
-  it('miss + 未注册站点 URL → 转发，并带上 startUrl', () => {
-    expect(decideTier4('帮我去 shop.example.org 查一下价格', MISS, ADAPTERS)).toEqual({
+  it('miss + 用户显式给出的未注册站点链接 → 转发，并带上 startUrl', () => {
+    expect(decideTier4('看看 shop.example.org', MISS, ADAPTERS)).toEqual({
       dispatch: true,
       startUrl: 'https://shop.example.org',
       reason: 'unknown-site',
     })
   })
 
+  it('普通对话里顺带提到未注册域名 → 不转发（形态闸门）', () => {
+    expect(decideTier4('帮我去 shop.example.org 查一下价格', MISS, ADAPTERS).reason).toBe('not-explicit-link')
+  })
+
+  it('legacy 档回退旧宽触发：任意含未注册域名的句子都转交', () => {
+    expect(decideTier4('帮我去 shop.example.org 查一下价格', MISS, ADAPTERS, { triggerMode: 'legacy' })).toEqual({
+      dispatch: true,
+      startUrl: 'https://shop.example.org',
+      reason: 'unknown-site',
+    })
+  })
+
+  it('WEWORKER_TIER4_TRIGGER=legacy 恢复旧宽触发', () => {
+    process.env.WEWORKER_TIER4_TRIGGER = 'legacy'
+    expect(decideTier4('帮我去 shop.example.org 查一下价格', MISS, ADAPTERS).reason).toBe('unknown-site')
+  })
+
+  it('本地已有承接者（额外已知站点）→ 不转发', () => {
+    expect(
+      decideTier4('看看 shop.example.org', MISS, ADAPTERS, { extraKnownHosts: ['shop.example.org'] }),
+    ).toEqual({ dispatch: false, startUrl: null, reason: 'local-capability' })
+  })
+
+  it('非 full 权限 → 不转发', () => {
+    expect(decideTier4('看看 shop.example.org', MISS, ADAPTERS, { permissionMode: 'qa_only' })).toEqual({
+      dispatch: false,
+      startUrl: null,
+      reason: 'permission-qa_only',
+    })
+  })
+
   it('用户禁用的站点不得绕道第4层复活（已知站点集合含禁用项）', () => {
     expect(decideTier4('看看 example.com', MISS, ADAPTERS).dispatch).toBe(false)
+  })
+})
+
+describe('normalizeHost / isKnownSiteHost：站点归一化与承接判定', () => {
+  it('小写、去端口、去末尾点', () => {
+    expect(normalizeHost('HTTPS://Example.COM:8443/a?b=1')).toBe('example.com')
+    expect(normalizeHost('example.com.')).toBe('example.com')
+  })
+
+  it('www./m./mobile. 视为同站别名', () => {
+    const known = buildKnownHosts(new Map([['x', adapter('x', ['www.example.org'])]]))
+    expect(isKnownSiteHost('example.org', known)).toBe(true)
+    expect(isKnownSiteHost('m.example.org', known)).toBe(true)
+    expect(isKnownSiteHost('other.example.net', known)).toBe(false)
+  })
+
+  it('*. 通配子域命中（含裸域名本身）', () => {
+    const known = buildKnownHosts(new Map<string, ParsedAdapter>(), ['*.example.org'])
+    expect(isKnownSiteHost('a.b.example.org', known)).toBe(true)
+    expect(isKnownSiteHost('example.org', known)).toBe(true)
+    expect(isKnownSiteHost('notexample.org', known)).toBe(false)
+  })
+})
+
+describe('isExplicitLinkInput：显式链接形态闸门', () => {
+  it('整条消息就是一个 URL / 裸域名 → 是', () => {
+    expect(isExplicitLinkInput('https://shop.example.org/a?b=1')).toBe(true)
+    expect(isExplicitLinkInput('shop.example.org')).toBe(true)
+  })
+
+  it('短句且句首是显式开页意图 → 是', () => {
+    expect(isExplicitLinkInput('打开 https://shop.example.org 看看')).toBe(true)
+    expect(isExplicitLinkInput('帮我看看 shop.example.org')).toBe(true)
+  })
+
+  it('普通对话里顺带提到域名 → 否', () => {
+    expect(isExplicitLinkInput('帮我去 shop.example.org 查一下价格')).toBe(false)
+    expect(isExplicitLinkInput('参考 shop.example.org 的写法改一下我的 adapter')).toBe(false)
+  })
+
+  it('超长句子即便句首是开页意图也不自动转交', () => {
+    expect(isExplicitLinkInput(`打开 https://shop.example.org ${'补充说明'.repeat(20)}`)).toBe(false)
+  })
+
+  it('`!` 别名命令不升级成探索任务', () => {
+    expect(isExplicitLinkInput('!example.com')).toBe(false)
   })
 })
 

@@ -71,7 +71,7 @@
 | 12 | **Tier 2 · 词法召回 → LLM 分类** | 词法召回 top-8 且 overlap ≥ 0.08 → 一次 `/v1/messages`（12s、256 tokens） | 设置项 `api_query_llm_route` / `WEWORKER_LLM_ROUTE=1` | 由 LLM 抽取 | 通用 | **默认关** | 多工具、多跳、工具链；LLM 返回的 tool 不在候选内一律判 null（严禁臆造） |
 | 13 | **落回 `streamChat`** | 以上全不命中 | — | — | — | — | — |
 | 14 | **第 3 层 · siteGate 分流** | 消息命中 adapter 域名 / `gate_aliases` / 已毕业 toolkit skill | adapter manifest + toolkit skill 目录 | — | — | `WEWORKER_SITE_GATE=0` | 多站点同命中一律按 ambiguous 保守处理 |
-| 15 | **第 4 层 · 网站探索agent** | siteGate 未命中 **且** 消息含未注册站点 URL | 纯函数判定 | — | 探索任务 `final_response` | `WEWORKER_TIER4=0`、`WEWORKER_TIER4_TIMEOUT_MS`、`WEWORKER_TIER4_ALLOW_WRITES=1` | 无 URL 信号的普通对话；host 已注册（含被禁用站点）；站点判定为已知但未启用 |
+| 15 | **第 4 层 · 网站探索agent** | siteGate 未命中 **且** 用户**显式给出一个链接**（整条消息是 URL／裸域名，或 ≤64 字且句首是打开/看看/分析…）**且** 该 host 本地无任何承接者（adapter 含禁用 / `*.` 通配子域 / 已毕业 toolkit skill / 用户目录已装包）**且** 权限为 `full` | 纯函数判定 | — | 探索任务 `final_response` | `WEWORKER_TIER4=0`、`WEWORKER_TIER4_TRIGGER=legacy`（回退旧宽触发）、`WEWORKER_TIER4_TIMEOUT_MS`、`WEWORKER_TIER4_ALLOW_WRITES=1` | 无 URL 信号的普通对话；**普通对话里顺带提到域名**；host 已注册（含被禁用站点、`www.`/`m.` 别名与 `*.` 通配子域）；已毕业 toolkit skill；受限权限模式 |
 | 16 | **毕业管线（第 4 → 3 层）** | 同一 host 第 4 层任务成功 N 次（默认 3） | `CONFIG_DIR/tier4-usage.json` | — | 提示文案 | `WEWORKER_TIER4_GRADUATE_AFTER=0` | — |
 | 17 | **page-prep 编排** | 命中工具声明了 `execution.navigate_before` | adapter manifest | — | — | `WEWORKER_PAGE_PREP=0`、`WEWORKER_PAGE_PREP_WAIT_MS`（默认 5000） | 无 URL 的工具零调用；`tools_ready` 信号缺失/超时节用固定等待上限（向后兼容旧 Bridge） |
 
@@ -233,7 +233,7 @@ weworker/router-config/          # 随包分发的默认配置（进 git，公�
 
 - `webwright-client.ts`：8766 最小客户端（健康检查 / 建任务 / 查任务 / 取消 / SSE 事件流）。
 - `site-gate.ts`：站点判定（域名子串、拉丁别名词边界、CJK 子串、多站点 ambiguous、禁用视同未命中）。
-- `tier4-dispatch.ts`：第 4 层分流与即时执行（未注册站点 URL 提取、只读护栏段、超时取消、事件流中断恢复、用户中止静默取消）。
+- `tier4-dispatch.ts`：第 4 层分流与即时执行（**显式链接形态闸门** + 本地承接闸门 + 权限闸门 + 未注册站点 URL 提取、只读护栏段、超时取消、事件流中断恢复、用户中止静默取消）。
 - `tier4-graduation.ts` + `toolkit-skills.ts`：毕业计数与已毕业站点并入 siteGate。
 - `server.ts`：仅在 `POST /works/:id/chat` 增加第 4 层接线块；**不得覆盖**本仓较新的模型配置逻辑。
 

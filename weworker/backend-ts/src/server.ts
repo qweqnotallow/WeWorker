@@ -3167,12 +3167,20 @@ async function handleChatRequest(req: express.Request<{ id: string }>, res: expr
           (siteToolkit ? ` tools=${siteToolkit.toolCount}/${siteToolkit.total}` : ''),
       )
     }
-    // 第4层即时执行（第15行）：siteGate miss + 消息含未注册站点 URL 信号 + 网站探索agent健康 +
-    // 建任务成功 → 该轮转交网站探索agent，事件源换成第4层流；任一条件不过 → 第3层 streamChat
-    // （今天的行为，漏判免费）。急停 WEWORKER_TIER4=0 时 decideTier4 直接返回不转发。
+    // 第4层即时执行（第15行）：siteGate miss + **用户显式给出一个链接** + 该 host 本地无承接能力 +
+    // 网站探索agent健康 + 建任务成功 → 该轮转交网站探索agent，事件源换成第4层流；任一条件不过 →
+    // 第3层 streamChat（漏判免费）。急停 WEWORKER_TIER4=0 时 decideTier4 直接返回不转发；
+    // WEWORKER_TIER4_TRIGGER=legacy 可回退到旧的宽触发（任意含未注册域名的句子）。
     let tier4Task: { taskId: string; startUrl: string; startedAt: number } | null = null
     let tier4Source: AsyncGenerator<SSEEvent> | null = null
-    const tier4 = decideTier4(message, siteGate, allAdapters)
+    // strict 档的闸门见 tier4-dispatch.ts：它一旦触发就整轮替换事件源（下面的 `tier4Source ?? streamChat`），
+    // 本轮模型手里的全部工具都不可达，所以不能按「句子里出现域名」宽判。
+    // - extraKnownHosts：已毕业 toolkit skill 与 siteGate 候选同源，它们已有本地工具，不得被抢答；
+    // - permissionMode：桌面 /chat 与 buildSystemPrompt/streamChat 的默认一致（'full'）。
+    const tier4 = decideTier4(message, siteGate, allAdapters, {
+      extraKnownHosts: toolkitSkills.flatMap((skill) => skill.hosts),
+      permissionMode: 'full',
+    })
     if (tier4.dispatch) {
       const health = await checkWebwrightHealth()
       if (!health.ok) {

@@ -1,8 +1,16 @@
 /**
  * 第4层分流与即时执行转发（`docs/intelligent_routing_design.md` §2 第 15 行）。
  *
- * 分流判定（`decideTier4`，纯函数）：siteGate miss **且** 消息含未注册站点的 URL/域名信号
- * **且** env 急停未关。任一不成立 → 第3层（今天的行为；漏判免费）。
+ * 分流判定（`decideTier4`，纯函数）默认 `strict` 档，四道闸门**同时**成立才转交：
+ *   ① 形态：用户**显式给出一个链接**（整条消息是 URL／裸域名，或 ≤64 字且句首是显式开页意图）；
+ *   ② 承接：该 host 本地**无任何承接者**（已注册 adapter（含禁用）/ `*.` 通配子域 / 已毕业
+ *      toolkit skill / 用户目录已装包），有的交回模型用本地工具；
+ *   ③ 权限：仅 `full` 模式；
+ *   ④ 判定：siteGate `miss`（`ambiguous` / `disabled` 不转交），且 env 急停未关。
+ *
+ * 为什么第 ① 条必须这么窄：本层一旦触发就**整轮替换事件源**（`server.ts` 的
+ * `tier4Source ?? streamChat`），本轮模型手里的全部工具都不可达——包括探索自己生成的 adapter
+ * 与后续接入的其它探索类工具。旧口径「句子里出现未注册域名就转交」会静默抢答这些工具。
  *
  * 执行（`runWebwrightTaskTurn`）：网站探索agent任务事件 → 既有 chat `SSEEvent` 序列；
  * 超时/中止取消任务；`waiting_for_user` 引导去网站探索agent UI 接管（不是错误）。
@@ -50,6 +58,10 @@ const FILE_EXTENSION_TLDS = new Set([
 const URL_RE = /https?:\/\/[^\s<>"'`]+/i
 const BARE_DOMAIN_RE = /\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}\b(?::\d{2,5})?(?:\/[^\s<>"'`]*)?/i
 
+/** `www.` / `m.` / `mobile.` 只是同一站点的入口别名，不构成独立站点。 */
+const WEB_HOST_LABELS = new Set(['www', 'm', 'mobile'])
+const MAX_HOST_LENGTH = 253
+
 function stripTrailingPunctuation(raw: string): string {
   return raw.replace(/[.,;:!?()[\]{}<>"'`、。，；！？）】…—-]+$/g, '')
 }
@@ -63,39 +75,123 @@ function hostOf(url: string): string {
 }
 
 /**
- * 提取消息指向的第一个「未注册站点」URL（归一化为含 scheme 的 start_url）；无信号/均为已知站点 → null。
- * 已知站点 = 任何已注册 adapter 的 `match` 条目（含禁用——用户禁用的站点不得绕道第4层复活）。
+ * host 归一化：小写、去端口、去末尾点、去 scheme/路径。
  *
- * **只认首个信号**（`URL_RE` / `BARE_DOMAIN_RE` 非全局）：消息里先出现已注册站点时，视为「用户
- * 当下说的是这个站点」，不再去找后面的未注册域名。这是刻意的保守取舍——考虑后续域名只会**扩大**
- * 第4层转发面，而漏判的代价只是落回第3层（设计允许的方向）。
+ * 为什么必须归一：`match` 里既写 `example.com` 又写 `www.example.com`（各 adapter 不一致），
+ * 而用户粘贴的链接带 `www.`/端口/末尾点是常态。不归一就会把「已注册站点」判成「未注册」，
+ * 于是第 4 层抢答本该由本地工具回答的请求。
  */
-export function extractUnknownSiteUrl(message: string, knownHosts: Set<string>): string | null {
-  const text = String(message || '')
+export function normalizeHost(raw: string): string {
+  const text = String(raw ?? '').trim().toLowerCase()
+  if (!text) return ''
+  let host = hostOf(/^[a-z][a-z0-9+.-]*:\/\//.test(text) ? text : `https://${text}`)
+  if (!host) host = text.replace(/^[a-z][a-z0-9+.-]*:\/\//, '').split(/[/?#]/)[0]
+  host = host.replace(/:\d+$/, '').replace(/\.+$/, '')
+  return host.length > MAX_HOST_LENGTH ? '' : host
+}
+
+/** 同站别名：`www.x.com` 与 `x.com` 视为同一个站点（只剥一层 web 入口前缀）。 */
+export function hostAliasVariants(host: string): string[] {
+  const normalized = normalizeHost(host)
+  if (!normalized) return []
+  const dot = normalized.indexOf('.')
+  if (dot <= 0) return [normalized]
+  const first = normalized.slice(0, dot)
+  const rest = normalized.slice(dot + 1)
+  // `rest` 必须仍是域名（含点），否则 `www.localhost` 会被剥成单标签。
+  if (WEB_HOST_LABELS.has(first) && rest.includes('.')) return [normalized, rest]
+  return [normalized]
+}
+
+/** 把一条 manifest `match` / toolkit `allowed_domains` 条目写入已知站点集合（含 `*.` 通配）。 */
+function addKnownHost(hosts: Set<string>, raw: string): void {
+  const entry = String(raw ?? '').trim().toLowerCase()
+  if (!entry) return
+  if (entry.startsWith('*.')) {
+    const suffix = normalizeHost(entry.slice(2))
+    if (!suffix) return
+    hosts.add(`*.${suffix}`)
+    for (const variant of hostAliasVariants(suffix)) hosts.add(variant)
+    return
+  }
+  for (const variant of hostAliasVariants(entry)) hosts.add(variant)
+}
+
+/**
+ * 已知站点集合 = 任何已注册 adapter 的 `match` 条目（含禁用——用户禁用的站点不得绕道第4层复活）。
+ * 可追加额外来源（已毕业 toolkit skill 的 `allowed_domains`、用户目录已安装 adapter）。
+ */
+export function buildKnownHosts(
+  allAdapters: Map<string, ParsedAdapter>,
+  extraHosts: Iterable<string> = [],
+): Set<string> {
+  const hosts = new Set<string>()
+  for (const adapter of allAdapters.values()) {
+    for (const match of adapter.match ?? []) addKnownHost(hosts, String(match))
+  }
+  for (const host of extraHosts) addKnownHost(hosts, host)
+  return hosts
+}
+
+/** 该 host 是否已有本地承接者（精确 / 同站别名 / `*.` 通配三种口径）。 */
+export function isKnownSiteHost(host: string, knownHosts: Iterable<string>): boolean {
+  const variants = hostAliasVariants(host)
+  if (!variants.length) return false
+  const known: Set<string> = knownHosts instanceof Set ? (knownHosts as Set<string>) : new Set(knownHosts)
+  for (const variant of variants) if (known.has(variant)) return true
+  for (const entry of known) {
+    if (!entry.startsWith('*.')) continue
+    const suffix = entry.slice(2)
+    for (const variant of variants) {
+      if (variant === suffix || variant.endsWith(`.${suffix}`)) return true
+    }
+  }
+  return false
+}
+
+/** 消息里的站点候选（含 scheme、已剥尾部标点、已排除文件扩展名 TLD），保持出现顺序。 */
+function siteTokens(text: string): string[] {
   const candidates = [
     ...(text.match(URL_RE) ?? []).map(stripTrailingPunctuation),
     ...(text.match(BARE_DOMAIN_RE) ?? []).map(stripTrailingPunctuation),
   ].filter(Boolean)
+  const tokens: string[] = []
   for (const candidate of candidates) {
     const withScheme = /^https?:\/\//i.test(candidate) ? candidate : `https://${candidate}`
     const host = hostOf(withScheme)
     if (!host) continue
     if (FILE_EXTENSION_TLDS.has(host.slice(host.lastIndexOf('.') + 1))) continue
-    if (knownHosts.has(host)) continue
-    return withScheme
+    tokens.push(withScheme)
   }
-  return null
+  return tokens
 }
 
-export function buildKnownHosts(allAdapters: Map<string, ParsedAdapter>): Set<string> {
-  const hosts = new Set<string>()
-  for (const adapter of allAdapters.values()) {
-    for (const match of adapter.match ?? []) {
-      const host = hostOf(`https://${String(match)}`)
-      if (host) hosts.add(host)
-    }
-  }
-  return hosts
+/** 消息里第一个站点信号（不区分是否已注册）；无信号 → null。 */
+export function firstSiteToken(message: string): string | null {
+  return siteTokens(String(message || ''))[0] ?? null
+}
+
+/**
+ * 提取消息指向的第一个「未注册站点」URL（归一化为含 scheme 的 start_url）；无信号/首个信号为已知站点 → null。
+ *
+ * **只认首个信号**：消息里先出现已注册站点时，视为「用户当下说的是这个站点」，不再去找后面的未注册域名。
+ * 这是刻意的保守取舍——考虑后续域名只会**扩大**第 4 层转发面，而漏判的代价只是落回第 3 层
+ * （设计允许的方向）。
+ *
+ * 注：旧实现对该情况是 `continue`（跳过已知站点、继续返回后面的未注册域名），与上面这条口径
+ * 正好相反；现按口径实现，方向上是**减少**转交。
+ */
+export function extractUnknownSiteUrl(
+  message: string,
+  knownHosts: Iterable<string>,
+  extraHosts: Iterable<string> = [],
+): string | null {
+  const known = new Set(knownHosts)
+  for (const host of extraHosts) addKnownHost(known, host)
+  const token = firstSiteToken(message)
+  if (!token) return null
+  if (isKnownSiteHost(hostOf(token), known)) return null
+  return token
 }
 
 // ─── 分流判定（纯）────────────────────────────────────────────────────────
@@ -108,16 +204,114 @@ export interface Tier4Decision {
   reason: string
 }
 
+/**
+ * 触发档位：
+ * - `strict`（默认）——只有「用户显式给出一个链接」的输入环境才允许第 4 层接手；
+ * - `legacy`——今天的宽触发（任意含未注册域名的句子都转交），仅用于一键回退。
+ *
+ * host 归一化（`www.` 别名 / `*.` 通配）在两种档位都生效：它只把「已注册站点」认得更全，
+ * 方向上是**减少**转交（漏判免费），不属于闸门范围。
+ */
+export type Tier4TriggerMode = 'strict' | 'legacy'
+
+export type Tier4PermissionMode = 'qa_only' | 'no_bash' | 'full'
+
+export interface Tier4DecisionDeps {
+  /** 额外的已知站点来源（已毕业 toolkit skill 的 `allowed_domains` 等）。 */
+  extraKnownHosts?: Iterable<string>
+  /** 当前会话权限模式。第 4 层会拉起浏览器并写用户目录，只在 `full` 下自动转交。 */
+  permissionMode?: Tier4PermissionMode
+  /** 触发档位；缺省读 `WEWORKER_TIER4_TRIGGER`（`legacy` 才回退，其余一律 strict）。 */
+  triggerMode?: Tier4TriggerMode
+}
+
+export function tier4TriggerMode(): Tier4TriggerMode {
+  return String(process.env.WEWORKER_TIER4_TRIGGER || '').trim().toLowerCase() === 'legacy'
+    ? 'legacy'
+    : 'strict'
+}
+
+/** 显式链接输入的短句上限：超过这个长度就不算「用户给了一个链接」，而是普通对话里提到了域名。 */
+export const TIER4_EXPLICIT_LINK_MAX_CHARS = 64
+
+/** 显式开页意图（句首，允许礼貌前缀）：没有这个动词的长句即便带链接也不自动转交。 */
+const OPEN_INTENT_RE =
+  /^(?:请|麻烦|帮我|帮忙)?\s*(?:打开|看看|看一下|看一眼|看下|瞧瞧|查看|浏览|访问|分析一下|分析|解析|open|visit|check out|look at|have a look at|analy[sz]e)/i
+
+const WHOLE_URL_RE = /^https?:\/\/[^\s<>"'`]+$/i
+const WHOLE_DOMAIN_RE = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/i
+const SURROUNDING = /^[<「『("'（【\[]\s*|\s*[>」』)"'）】\]]$/g
+
+function unwrapQuotes(text: string): string {
+  let out = text
+  for (let i = 0; i < 2; i += 1) {
+    const next = out.replace(SURROUNDING, '')
+    if (next === out) break
+    out = next
+  }
+  return out
+}
+
+/**
+ * 形态闸门：这是不是「用户显式给出一个链接」的输入环境？
+ *
+ * 放行的三种形态（其余一律不自动转交）：
+ * 1. 整条消息就是一个 URL；
+ * 2. 整条消息就是一个裸域名（`shop.example.org`）；
+ * 3. ≤64 字的短句，且**句首**是显式开页意图（打开 / 看看 / 分析…），句中带链接或域名。
+ *
+ * 为什么收这么窄：第 4 层一旦触发会整轮替换事件源（`server.ts` 的 `tier4Source ?? streamChat`），
+ * 本轮模型手里的全部工具（含探索生成的 adapter 与 toolkit skill 工具）都不可达。所以只认
+ * 「用户就是在给一个链接」这一种输入环境，避免抢答普通对话与后续接入的探索类工具。
+ */
+export function isExplicitLinkInput(message: string): boolean {
+  const raw = String(message ?? '').trim()
+  if (!raw) return false
+  // `!` 是显式点名工具：让位给别名校验，绝不升级成探索任务。
+  if (raw.startsWith('!')) return false
+  const text = unwrapQuotes(stripTrailingPunctuation(raw))
+  if (!text) return false
+  if (WHOLE_URL_RE.test(text)) return true
+  if (!/\s/.test(text) && WHOLE_DOMAIN_RE.test(text)) {
+    const tld = text.slice(text.lastIndexOf('.') + 1)
+    if (!FILE_EXTENSION_TLDS.has(tld)) return true
+  }
+  if (text.length > TIER4_EXPLICIT_LINK_MAX_CHARS) return false
+  if (!OPEN_INTENT_RE.test(text)) return false
+  return firstSiteToken(text) !== null
+}
+
 export function decideTier4(
   message: string,
   siteGate: SiteGateResult,
   allAdapters: Map<string, ParsedAdapter>,
+  deps: Tier4DecisionDeps = {},
 ): Tier4Decision {
   if (process.env.WEWORKER_TIER4 === '0') return { dispatch: false, startUrl: null, reason: 'env-off' }
   if (siteGate.reason !== 'miss') return { dispatch: false, startUrl: null, reason: `sitegate-${siteGate.reason}` }
-  const startUrl = extractUnknownSiteUrl(message, buildKnownHosts(allAdapters))
-  if (!startUrl) return { dispatch: false, startUrl: null, reason: 'no-unknown-site-signal' }
-  return { dispatch: true, startUrl, reason: 'unknown-site' }
+
+  const mode = deps.triggerMode ?? tier4TriggerMode()
+  if (mode === 'strict') {
+    // 闸门④（权限）：探索会拉起浏览器并写用户目录，受限权限模式一律交回模型。
+    const permissionMode = deps.permissionMode ?? 'full'
+    if (permissionMode !== 'full') {
+      return { dispatch: false, startUrl: null, reason: `permission-${permissionMode}` }
+    }
+    // 闸门①（形态）：不是「显式给链接」的输入环境 → 不转交。
+    if (!isExplicitLinkInput(message)) {
+      return { dispatch: false, startUrl: null, reason: 'not-explicit-link' }
+    }
+  }
+
+  const token = firstSiteToken(message)
+  if (!token) return { dispatch: false, startUrl: null, reason: 'no-unknown-site-signal' }
+  // 闸门②（承接）：该 host 已有本地能力（adapter / 已毕业 toolkit / 用户目录已装包）→ 交回模型。
+  const knownHosts = buildKnownHosts(allAdapters, deps.extraKnownHosts ?? [])
+  if (isKnownSiteHost(hostOf(token), knownHosts)) {
+    // legacy 档沿用旧 reason，保证回退时日志口径与迁移前一致（便于对照历史日志）。
+    return { dispatch: false, startUrl: null, reason: mode === 'strict' ? 'local-capability' : 'no-unknown-site-signal' }
+  }
+  return { dispatch: true, startUrl: token, reason: 'unknown-site' }
 }
 
 // ─── 即时执行回合（async generator）──────────────────────────────────────
